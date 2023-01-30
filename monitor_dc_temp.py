@@ -1,17 +1,17 @@
 # Standard library
 import argparse
+import asyncio
+import inspect
 import logging
-import pathlib
-import sys
 import os
+import pathlib
+import pprint as pp
+import sys
+import time
 import traceback
 from logging.handlers import RotatingFileHandler
-from typing import Optional
-import inspect
-import pprint as pp
-import time
-import asyncio
 from http import HTTPStatus
+from typing import Optional
 
 # Third party library
 import httpx
@@ -34,15 +34,23 @@ class MonitorDCTemp():
         """
         
         # Setup default values for monitoring
-        self.threshold = 90
-        self.slo = 30
-        self.zip = None
+        if os.getenv('THRESHOLD_TEMP') is None:
+            self.threshold = 90
+        else:
+            self.threshold = float(os.getenv('THRESHOLD_TEMP'))
+        if os.getenv('SLO_TEMP') is None:
+            self.slo = 300
+        else:
+            self.slo = int(os.getenv('SLO_TEMP'))
         self.lon = float(-73.8961)
         self.lat = float(40.7036)
         self.weather_url = os.getenv('OPENWEATHERMAP_URL')
         self.weather_key = os.getenv('OPENWEATHERMAP_KEY')
         self.slack_token = os.getenv('SLACK_TOKEN')
-        self.semaphores = 2
+        if os.getenv('SEMAPHORES') is None:
+            self.semaphores = 2
+        else:
+            self.semaphores = int(os.getenv('SEMAPHORES'))
         self.count = 0
 
         # Setup Log Naming and Path
@@ -104,7 +112,7 @@ class MonitorDCTemp():
 
         return True
     
-    def send_message(self, msg: str = ""):
+    def notify(self, msg: str = ""):
         """
         Send a message to slack
         """
@@ -119,26 +127,34 @@ class MonitorDCTemp():
         #     )
         # except SlackApiError as e:
         #     self.msg(f"Slack failed to send message\n{e.response['error']}")
+
+        return True
+
+    def set_location(self, zip: int = 11385) -> bool:
+        """
+        Set lon and lat from zip code
+        """
+
+        try:
+            location = requests.get(
+                f"{self.weather_url}/geo/1.0/zip?zip={zip},US&appid={self.weather_key}", timeout=5)
+            
+            if location.status_code != requests.codes['ok']:
+                raise Exception(f"Bad response\n{location.text}")
+            
+            self.lat, self.lon = location.json()['lat'], location.json()['lon']
+            self.msg(f"{location.json()}", debug=True)
+
+        except:
+            self.msg(f"{traceback.format_exc()}", debug=True)
+            return False
+
+        return True
     
     def get_blocking_weather(self) -> bool:
         """
         Get weather from openweathermap.org via blocking method
         """
-        
-        # Get location
-        if self.zip is not None:
-            try:
-                location = requests.get(
-                    f"{self.weather_url}/geo/1.0/zip?zip={self.zip},US&appid={self.weather_key}", timeout=5)
-                
-                if location.status_code != requests.codes['ok']:
-                    raise Exception(f"Bad response\n{location.text}")
-                
-                self.lat, self.lon = location.json()['lat'], location.json()['lon']
-                self.msg(f"{location.json()}", debug=True) 
-            except:
-                self.msg(f"{traceback.format_exc()}", debug=True)
-                return False
             
         # Get current weather
         try:
@@ -159,7 +175,9 @@ class MonitorDCTemp():
         
         # Check for threshold and send notice
         if current_temp > self.threshold:
-            self.msg(f"Threshold of {self.threshold}F reached for {location_name} ({current_temp}F)")
+            note = f"Threshold of {self.threshold}F reached for {location_name} ({current_temp}F)"
+            self.msg(note)
+            self.notify(note)
         else:
             self.msg(f"Threshold of {self.threshold}F NOT reached for {location_name} ({current_temp}F)")
         
@@ -169,8 +187,7 @@ class MonitorDCTemp():
         if not subtract:
             self.count += 1
         elif self.count > 0:
-            self.count -= 1
-            
+            self.count -= 1 
     
     async def get_nonblocking_weather(self, semaphore: asyncio.Semaphore, num: int = 0):
         """
@@ -205,6 +222,11 @@ class MonitorDCTemp():
                     self.msg(f"{r.json()}", debug=True)
                     
                     # Check for threshold and send notice
+                    # Account for (datadog does this, not needed)...
+                    # * Notify on SLO being reached
+                    # * Notify on SLO being cleared
+                    # * Keep notifying on SLO being reached
+                    # * Don't keep notifying if cleared
                     if current_temp > self.threshold:
                         await self.counter()
                         self.msg(
@@ -223,7 +245,7 @@ class MonitorDCTemp():
                               self.count > (self.semaphores * (self.slo / 10)) - 1):
                             # Reset count now that SLO has been reached and send notice
                             self.msg(f"SLO of {self.slo} seconds reached, sending notice and resetting count")
-                            self.send_message(
+                            self.notify(
                                 f"{self.count} count(s) of {self.threshold}F threshold "
                                 f"reached at {location_name} ({current_temp}F) for {time.time() - start} seconds"
                             )
@@ -250,7 +272,7 @@ class MonitorDCTemp():
                             # Reset count now that SLO has been cleared and send notice
                             self.msg(f"SLO of {self.slo} seconds reached, clearing notice and resetting count")
                             if fired:
-                                self.send_message(
+                                self.notify(
                                     f"{self.count} count(s) of {self.threshold}F threshold has NOT "
                                     f"reached at {location_name} ({current_temp}F) for {time.time() - start} seconds"
                                 )
@@ -282,7 +304,7 @@ def parse_cmdline(args: list) -> argparse.Namespace:
     parser.add_argument(
         '-z', '--zip',
         action='store',
-        help="Get geolocation from zipcode"
+        help="Set geolocation from zipcode"
     )
     parser.add_argument(
         '-c', '--concurrency',
@@ -310,7 +332,7 @@ def parse_cmdline(args: list) -> argparse.Namespace:
     if options.verbose:
         mon.set_debug()
     if options.zip:
-        mon.zip = int(options.zip)
+        mon.set_location(zip=int(options.zip))
     if options.threshold:
         mon.threshold = float(options.threshold)
     if options.concurrency:
